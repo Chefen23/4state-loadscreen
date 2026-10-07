@@ -2,12 +2,14 @@
   'use strict';
 
   const config = window.LoadingScreenConfig || {};
+  const video = document.getElementById('background-video');
   const muteButton = document.getElementById('mute');
   const slider = document.getElementById('volume');
   const output = document.getElementById('volume-value');
   const label = document.getElementById('mute-label');
   const message = document.getElementById('message');
   const progress = document.getElementById('loading-progress');
+  const audioControls = document.querySelector('.audio-controls');
 
   const barColor = config.progressBarColor;
   if (typeof barColor === 'string' && /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(barColor)) {
@@ -21,53 +23,39 @@
     progress.value = Math.max(0, Math.min(1, data.loadFraction));
   });
 
-  function getYouTubeId(value) {
-    if (typeof value !== 'string' || !value.trim()) return null;
-    const raw = value.trim();
-
-    if (/^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
-
+  const isHttpsUrl = value => {
+    if (typeof value !== 'string' || !value.trim()) return false;
     try {
-      const url = new URL(raw);
-      const host = url.hostname.replace(/^www\./, '').toLowerCase();
+      return new URL(value.trim()).protocol === 'https:';
+    } catch (_) {
+      return false;
+    }
+  };
 
-      if (host === 'youtu.be') {
-        const id = url.pathname.split('/').filter(Boolean)[0];
-        return /^[A-Za-z0-9_-]{11}$/.test(id || '') ? id : null;
-      }
-
-      if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'music.youtube.com') {
-        const watchId = url.searchParams.get('v');
-        if (/^[A-Za-z0-9_-]{11}$/.test(watchId || '')) return watchId;
-
-        const parts = url.pathname.split('/').filter(Boolean);
-        const marker = parts[0];
-        if (['embed', 'shorts', 'live'].includes(marker)) {
-          const id = parts[1];
-          return /^[A-Za-z0-9_-]{11}$/.test(id || '') ? id : null;
-        }
-      }
-    } catch (_) {}
-
-    return null;
+  function showMessage(text) {
+    message.textContent = text;
+    message.hidden = false;
   }
 
-  const videoId = getYouTubeId(config.videoUrl);
-  if (!videoId) {
+  function hideMessage() {
+    message.hidden = true;
+  }
+
+  if (!isHttpsUrl(config.videoUrl)) {
     showMessage('Video unavailable. Connecting to the server…');
-    console.error('[simple_loadscreen] Invalid YouTube URL in config.js.');
+    console.error('[simple_loadscreen] Invalid HTTPS video URL in config.js.');
     return;
   }
 
-  const storageKey = 'simple-loadscreen-audio-v2';
+  // New key so an old saved YouTube mute state cannot make the first native-video launch muted.
+  const storageKey = 'simple-loadscreen-audio-native-v1';
   const clamp = (value, fallback) => typeof value === 'number' && Number.isFinite(value)
     ? Math.max(0, Math.min(1, value)) : fallback;
 
   let volume = clamp(config.defaultVolume, 0.25);
   let muted = config.startMuted === true;
   let lastAudibleVolume = volume > 0 ? volume : 0.25;
-  let player = null;
-  let playerReady = false;
+  let autoplayBlocked = false;
 
   if (config.rememberVolume !== false) {
     try {
@@ -87,17 +75,12 @@
     } catch (_) {}
   }
 
-  function showMessage(text) {
-    message.textContent = text;
-    message.hidden = false;
-  }
-
-  function hideMessage() {
-    message.hidden = true;
-  }
-
   function syncControls() {
     const silent = muted || volume === 0;
+
+    video.volume = volume;
+    video.muted = silent;
+
     slider.value = String(Math.round(volume * 100));
     slider.setAttribute('aria-valuetext', `${slider.value} percent${silent ? ', muted' : ''}`);
     output.textContent = `${slider.value}%`;
@@ -106,38 +89,26 @@
     muteButton.setAttribute('aria-pressed', String(silent));
     document.getElementById('sound-waves').toggleAttribute('hidden', silent);
     document.getElementById('sound-off').toggleAttribute('hidden', !silent);
-
-    if (!playerReady || !player) return;
-
-    try {
-      player.setVolume(Math.round(volume * 100));
-      if (silent) player.mute();
-      else player.unMute();
-    } catch (_) {}
   }
 
-  function startPlayback() {
-    if (!playerReady || !player) return;
-
+  async function tryPlay() {
     try {
-      // Muted autoplay is the most reliable in Chromium/CEF.
-      player.mute();
-      player.setVolume(Math.round(volume * 100));
-      player.playVideo();
-
-      // Restore the configured sound state after playback has started.
-      window.setTimeout(() => {
-        if (!playerReady || !player) return;
-        try {
-          if (muted || volume === 0) player.mute();
-          else player.unMute();
-          player.setVolume(Math.round(volume * 100));
-        } catch (_) {}
-      }, 600);
-    } catch (_) {}
+      await video.play();
+      autoplayBlocked = false;
+      hideMessage();
+    } catch (error) {
+      autoplayBlocked = true;
+      if (error && error.name === 'NotAllowedError') {
+        showMessage('Click anywhere to start the video with sound.');
+      } else {
+        showMessage('Video could not start. Connecting to the server…');
+        console.error('[simple_loadscreen] Video playback failed:', error);
+      }
+    }
   }
 
-  muteButton.addEventListener('click', () => {
+  muteButton.addEventListener('click', event => {
+    event.stopPropagation();
     if (muted || volume === 0) {
       if (volume === 0) volume = lastAudibleVolume;
       muted = false;
@@ -146,71 +117,47 @@
     }
     syncControls();
     save();
-    startPlayback();
+    tryPlay();
   });
 
-  slider.addEventListener('input', () => {
+  slider.addEventListener('input', event => {
+    event.stopPropagation();
     volume = clamp(Number(slider.value) / 100, volume);
     muted = volume === 0;
     if (volume > 0) lastAudibleVolume = volume;
     syncControls();
     save();
-    startPlayback();
+    tryPlay();
   });
 
-  window.onYouTubeIframeAPIReady = () => {
-    player = new YT.Player('youtube-player', {
-      videoId,
-      playerVars: {
-        autoplay: 1,
-        controls: 0,
-        disablekb: 1,
-        fs: 0,
-        iv_load_policy: 3,
-        loop: 1,
-        modestbranding: 1,
-        playsinline: 1,
-        playlist: videoId,
-        rel: 0
-      },
-      events: {
-        onReady: () => {
-          playerReady = true;
-          syncControls();
-          startPlayback();
-        },
-        onStateChange: event => {
-          if (event.data === YT.PlayerState.PLAYING) hideMessage();
-          if (event.data === YT.PlayerState.ENDED) {
-            try { player.playVideo(); } catch (_) {}
-          }
-        },
-        onError: event => {
-          showMessage('Video unavailable. Connecting to the server…');
-          console.error('[simple_loadscreen] YouTube player error:', event.data);
-        },
-        onAutoplayBlocked: () => {
-          // The video can still be started from the sound/volume controls.
-          showMessage('Click the sound button to start the video.');
-        }
-      }
-    });
-  };
+  // If Chromium/FiveM blocks unmuted autoplay, the first user click anywhere starts it with sound.
+  document.addEventListener('pointerdown', event => {
+    if (!autoplayBlocked || audioControls.contains(event.target)) return;
+    tryPlay();
+  });
+
+  video.addEventListener('playing', hideMessage);
+  video.addEventListener('canplay', tryPlay, { once: true });
+  video.addEventListener('error', () => {
+    const mediaError = video.error;
+    showMessage('External video could not load. Check the GitHub Release asset URL and codec support.');
+    console.error('[simple_loadscreen] External video could not load.', mediaError ? mediaError.code : 'unknown');
+  });
+
+  video.controls = false;
+  video.loop = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.src = config.videoUrl.trim();
 
   syncControls();
-
-  const api = document.createElement('script');
-  api.src = 'https://www.youtube.com/iframe_api';
-  api.async = true;
-  api.onerror = () => {
-    showMessage('Video unavailable. Connecting to the server…');
-    console.error('[simple_loadscreen] Could not load the YouTube IFrame API.');
-  };
-  document.head.appendChild(api);
+  video.load();
+  tryPlay();
 
   window.addEventListener('pagehide', () => {
-    playerReady = false;
-    if (!player) return;
-    try { player.stopVideo(); } catch (_) {}
+    try { video.pause(); } catch (_) {}
+    video.removeAttribute('src');
+    try { video.load(); } catch (_) {}
   });
 })();
